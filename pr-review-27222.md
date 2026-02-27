@@ -15,7 +15,7 @@ Gated by session property `materialized_view_query_rewrite_cost_based_selection_
 
 ## Key Question: Aren't there already ways to hold multiple plans and choose the lowest cost?
 
-**Short answer: Not at the framework level — but there is a well-established pattern for doing it within a single rule, and this PR doesn't follow that pattern.**
+**Short answer: Not at the framework level — and while `ReorderJoins` provides a pattern for doing it within a single rule, that pattern doesn't apply here due to how MV compensation works.**
 
 ### Presto's optimizer architecture
 
@@ -37,39 +37,84 @@ This is the established pattern: enumerate alternatives, cost them, emit the win
 
 ---
 
-## Design Concerns
+## Why the PR can't follow the `ReorderJoins` pattern
 
-### 1. The `MVRewriteCandidatesNode` approach diverges from the established `ReorderJoins` pattern
+### MV compensation happens at the AST level, not the plan level
 
-`ReorderJoins` handles multi-plan comparison entirely within the rule — it enumerates alternatives, costs them, and returns the winner. No special plan node needed.
+This is the critical architectural constraint. Presto's `MaterializedViewQueryOptimizer` is an **AST rewriter** — it transforms the original `QuerySpecification` into a new SQL AST that reads from the MV table with compensation operations baked in:
 
-This PR takes a fundamentally different approach: it creates an `MVRewriteCandidatesNode` that carries unresolved alternatives **through** the plan tree across multiple optimizer phases, then has a later rule resolve it.
+1. **Table replacement**: `FROM base_table` → `FROM materialized_view`
+2. **Column remapping**: base table columns → MV columns via `baseToViewColumnMap`
+3. **Aggregate compensation**: `COUNT(x)` → `SUM(mv_count_x)` (re-aggregation over pre-aggregated MV data)
+4. **Filter compensation**: additional WHERE predicates if the MV's filter is broader than the query's
+5. **GROUP BY compensation**: rollup aggregation if the MV pre-aggregates at a finer granularity
 
-This means `MVRewriteCandidatesNode` must be handled by **every visitor** that traverses the plan tree between creation and resolution:
-- `ValidateDependenciesChecker` needed new code
-- `PlanVisitor` needed a new method
-- `Patterns` needed a new matcher
-- Any future plan visitors must also account for this node type
+Each MV candidate produces a structurally different `QuerySpecification` — essentially a different SQL query. For example:
 
-If the resolve rule doesn't fire (e.g., due to a bug, optimizer ordering issue, or the session property being toggled mid-optimization), you get a plan node with **no physical execution semantics** reaching the execution engine.
+```sql
+-- Original query:
+SELECT region, SUM(revenue) FROM sales WHERE date >= '2024-01-01' GROUP BY region
 
-**Recommendation**: Follow the `ReorderJoins` pattern — do the cost comparison at plan creation time in `RelationPlanner`, or in a single self-contained `PlanOptimizer` implementation (not an `IterativeOptimizer` rule) that materializes all candidate plans, costs them, and emits only the winner. This avoids needing a new plan node type entirely.
+-- MV1 (daily aggregates): needs rollup compensation
+SELECT region, SUM(daily_revenue) FROM mv_daily_sales WHERE date >= '2024-01-01' GROUP BY region
 
-### 2. Costing happens at a potentially unreliable point in the pipeline
-
-The `SelectLowestCostMVRewrite` rule is registered in `PlanOptimizers.java` using `costCalculator` (not `estimatedExchangesCostCalculator`). Looking at where it's placed:
-
-```java
-builder.add(new IterativeOptimizer(
-    metadata, ruleStats, statsCalculator, costCalculator,
-    ImmutableSet.of(new SelectLowestCostMVRewrite(costComparator))));
+-- MV2 (monthly aggregates): no rollup needed, but different columns
+SELECT region, monthly_revenue FROM mv_monthly_sales WHERE month >= '2024-01'
 ```
 
-Key questions:
-- **Where in the pipeline is this positioned?** If it runs before predicate pushdown, join reordering, and other transformations, the cost estimates for candidates will be based on unoptimized sub-plans and may be misleading
-- **Why `costCalculator` instead of `estimatedExchangesCostCalculator`?** Other cost-sensitive rules like `ReorderJoins` use `estimatedExchangesCostCalculator`. The PR should document this choice
+### The sequencing problem
 
-### 3. The unknown-cost handling has an asymmetric bias
+To cost a candidate, you need a plan. To get a plan, you need analysis. To get analysis, you need the compensated AST:
+
+```
+AST rewriting (compensation) → Analysis → Planning → [Optimization] → Costing
+         ↑                                                              ↑
+    happens here                                                  need this
+```
+
+`ReorderJoins` works entirely in the optimization phase — it rearranges existing, already-planned `JoinNode`s. It never introduces new tables, never needs type resolution, never invokes the analyzer. But MV compensation produces **new SQL ASTs referencing different tables with different schemas** that must traverse analysis → planning before they can be costed.
+
+### Specific barriers to a `ReorderJoins`-style approach
+
+1. **You'd need to invoke the analyzer + planner from within an optimizer rule.** The `Rule.Context` interface provides `CostProvider`, `StatsProvider`, `IdAllocator` — but NOT access to `StatementAnalyzer`, `RelationPlanner`, or `QueryPlanner`. Injecting the full analysis+planning pipeline into a rule would be architecturally unprecedented.
+
+2. **The plans need optimization before costing is meaningful.** Even if you could produce plans inside the rule, they'd be un-optimized (no predicate pushdown, no join reordering, no column pruning). Comparing "scan base table with complex compensating aggregation" vs "scan MV with simple projection" requires at least partial optimization to produce reliable cost estimates.
+
+3. **Each MV introduces entirely new table references.** `ReorderJoins` shuffles existing, already-resolved plan nodes. MV rewriting introduces `TableScanNode`s for tables the original query never referenced — requiring catalog lookups, schema resolution, column handle resolution, and permission checks that all happen during analysis, not optimization.
+
+### What would the real alternative be?
+
+The proper alternative would be Calcite-style **plan-level MV rewriting** — where compensation is computed as plan-level operations (inserting `FilterNode`, `AggregationNode`, `ProjectNode` on top of an MV `TableScanNode`) rather than AST-level SQL rewriting. This would allow MV selection to happen entirely within the optimizer. But it would require:
+
+- MV definitions stored as plan trees (not SQL text)
+- Plan nodes that carry full schema information (Calcite's `RelNode` is self-contained; Presto's `PlanNode` relies on the separate `Analysis` object)
+- A Cascades-style optimizer with memo structures to naturally hold multiple equivalent plans
+
+This is essentially the [New Optimizer](https://github.com/prestodb/presto/wiki/New-Optimizer) effort — a major architectural overhaul, not a pragmatic fix.
+
+### Assessment of the PR's approach
+
+Given Presto's current architecture, the 4-stage pipeline is a **reasonable pragmatic choice**:
+
+- Stages 1-3 (AST rewriting, analysis, planning) happen in the normal compilation pipeline, where each candidate gets a proper plan
+- Stage 4 (cost selection) happens as an optimizer rule where `CostProvider` is available
+- The `MVRewriteCandidatesNode` is conceptually analogous to `ReorderJoins`'s internal enumeration — it's just that the enumeration must be spread across compilation phases rather than contained in one rule
+
+The tradeoff is real but acceptable: the new plan node type adds visitor maintenance burden, but the alternative (plan-level MV rewriting) is a much larger effort.
+
+---
+
+## Remaining design concerns
+
+### 1. Costing happens at a potentially unreliable point in the pipeline
+
+The `SelectLowestCostMVRewrite` rule is registered in `PlanOptimizers.java` using `costCalculator` (not `estimatedExchangesCostCalculator`). Key questions:
+
+- **Where in the pipeline is this positioned?** If it runs before predicate pushdown, join reordering, and other transformations, the cost estimates for candidates will be based on unoptimized sub-plans and may be misleading. Ideally this rule should run after basic simplification passes but before physical planning.
+- **Why `costCalculator` instead of `estimatedExchangesCostCalculator`?** Other cost-sensitive rules like `ReorderJoins` use `estimatedExchangesCostCalculator`. The PR should document this choice.
+- **Do other optimizer rules fire on the sub-plans inside `MVRewriteCandidatesNode`?** If predicate pushdown, column pruning, etc. don't traverse into the candidate sub-plans, then the costs being compared are for un-optimized plans — making the comparison unreliable.
+
+### 2. The unknown-cost handling has an asymmetric bias
 
 From the `SelectLowestCostMVRewrite.apply()` method:
 
@@ -94,7 +139,7 @@ This means:
 
 The asymmetry is concerning: when statistics are missing for the base table but present for an MV (or vice versa), the selection is driven by which side happens to have stats rather than which is actually cheaper. This should be documented and may warrant a more conservative default (prefer original when costs can't be meaningfully compared).
 
-### 4. Data consistency check is bypassed
+### 3. Data consistency check is bypassed
 
 In `MaterializedViewQueryOptimizer`, the data consistency check is skipped when cost-based selection is enabled:
 
@@ -105,7 +150,7 @@ if (!isMaterializedViewDataConsistencyEnabled(session) ||
 
 This means enabling cost-based MV selection implicitly disables data consistency validation. This seems like a correctness concern that should be called out explicitly — it should be handled independently, not tied to the cost-based selection flag.
 
-### 5. Projection mapping assumes positional correspondence
+### 4. Projection mapping assumes positional correspondence
 
 ```java
 for (int i = 0; i < expectedOutputs.size(); i++) {
@@ -117,7 +162,7 @@ for (int i = 0; i < expectedOutputs.size(); i++) {
 
 The projection maps output variables by **position**, not by name or semantic meaning. If two MV rewrites produce the same columns in different orders, this will silently produce incorrect results. The `ValidateDependenciesChecker` only checks that output variable **counts** match, not that the semantic mapping is correct.
 
-### 6. Test gaps
+### 5. Test gaps
 
 - **No test for feature disabled**: All tests set `materialized_view_query_rewrite_cost_based_selection_enabled=true`. Need a test verifying the rule is a no-op when disabled.
 - **No integration test**: All tests use synthetic `ValuesNode`/`FilterNode` plans. No test verifies the full pipeline from SQL string → MV rewriting → cost selection → correct output.
@@ -129,10 +174,12 @@ The projection maps output variables by **position**, not by name or semantic me
 
 ## Summary
 
-The feature goal (cost-based MV selection) is sound and addresses a real limitation. However:
+The feature goal (cost-based MV selection) is sound and addresses a real limitation. The architectural approach — carrying multiple candidate plans through the compilation pipeline in `MVRewriteCandidatesNode` — is a pragmatic necessity given that MV compensation happens at the AST level. The `ReorderJoins` pattern doesn't apply because MV rewriting crosses the AST→analysis→planning boundary, unlike join reordering which operates entirely within the plan domain.
 
-1. **Architecture**: The approach of carrying unresolved multi-plan nodes through the plan tree diverges from the established `ReorderJoins` pattern and introduces unnecessary complexity. Consider resolving MV selection within a single self-contained step.
+The main concerns are:
 
-2. **Correctness risks**: Positional output mapping, data consistency bypass, and unknown-cost handling all have potential correctness implications that need more careful treatment.
+1. **Cost reliability**: The quality of the cost comparison depends critically on where `SelectLowestCostMVRewrite` sits in the optimizer pipeline and whether candidate sub-plans get optimized before costing. This needs documentation and possibly integration tests demonstrating the cost estimates are meaningful.
+
+2. **Correctness risks**: Positional output mapping, data consistency bypass, and asymmetric unknown-cost handling all have potential correctness implications that need more careful treatment.
 
 3. **Testing**: Needs integration tests, disabled-state tests, and stronger assertions on the projection path.
