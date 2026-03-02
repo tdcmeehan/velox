@@ -1752,6 +1752,47 @@ void Task::noMoreSplits(const core::PlanNodeId& planNodeId) {
   }
 }
 
+void Task::addExternalDynamicFilter(
+    const core::PlanNodeId& planNodeId,
+    column_index_t channel,
+    const common::FilterPtr& filter) {
+  std::lock_guard<std::timed_mutex> l(mutex_);
+  if (!isRunningLocked()) {
+    return;
+  }
+
+  // Find the pipeline whose first plan node matches planNodeId (TableScan is
+  // always operator 0 in its pipeline).
+  for (auto pipeline = 0; pipeline < driverFactories_.size(); ++pipeline) {
+    auto& factory = driverFactories_[pipeline];
+    if (factory->planNodes.empty() ||
+        factory->planNodes[0]->id() != planNodeId) {
+      continue;
+    }
+
+    // Find any driver in this pipeline to access shared PipelinePushdownFilters.
+    for (auto& driver : drivers_) {
+      if (!driver || driver->driverCtx()->pipelineId != pipeline) {
+        continue;
+      }
+
+      auto& pipelineFilters = driver->pushdownFilters();
+      if (!pipelineFilters || pipelineFilters->empty()) {
+        break;
+      }
+
+      // Operator 0 is the TableScan; merge the filter into its slot.
+      {
+        auto lk = pipelineFilters->at(0).wlock();
+        common::Filter::merge(filter, lk->filters[channel]);
+        lk->dynamicFilteredColumns.insert(channel);
+      }
+      return;
+    }
+    break;
+  }
+}
+
 void Task::setSplitsStore(
     const core::PlanNodeId& planNodeId,
     std::unique_ptr<SplitsStore> newSplitsStore) {

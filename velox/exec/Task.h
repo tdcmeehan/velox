@@ -261,6 +261,15 @@ class Task : public std::enable_shared_from_this<Task> {
   /// corresponding to plan node with specified ID.
   void noMoreSplits(const core::PlanNodeId& planNodeId);
 
+  /// Injects an externally-collected dynamic filter (e.g., from a coordinator)
+  /// into the pipeline whose first plan node matches 'planNodeId'.
+  /// The filter is merged into PipelinePushdownFilters for the target operator,
+  /// which will apply it to subsequent splits.
+  void addExternalDynamicFilter(
+      const core::PlanNodeId& planNodeId,
+      column_index_t channel,
+      const common::FilterPtr& filter);
+
   /// Use a customized split store implementation to replace the default queue
   /// split store for the specified node.  The customized split store should
   /// have its own source of splits and no longer need addSplit() call from
