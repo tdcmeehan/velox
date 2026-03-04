@@ -28,12 +28,12 @@ errorCode = new ErrorCode(code + 0x0510_0000, name(), type);
 
 Every type handler in the Lance scanner (`BitVector`, `TinyIntVector`, `SmallIntVector`, `IntVector`, `BigIntVector`, `Float4Vector`, `Float8Vector`, `VarCharVector`, `VarBinaryVector`, `DateDayVector`, `TimeStampMicroVector`, `ListVector`, `FixedSizeListVector`) is duplicated.
 
-**Recommendation:** Depend on `presto-base-arrow-flight` and use `ArrowBlockBuilder` for type resolution and vector conversion. If Lance-specific extensions are needed, enhance the shared utility.
+**Recommendation:** Do NOT depend on `presto-base-arrow-flight` directly — it transitively pulls in `flight-core` (gRPC 1.75.0 + Netty 4.1.130), which Lance has no use for. Instead, extract a new `presto-arrow-toolkit` module (see Appendix A below for the complete extraction plan).
 
 ### C3. `LanceFragmentPageSource`/`LanceBasePageSource` duplicate `ArrowPageSource` structure
 **Files:** `LanceBasePageSource.java`, `LanceFragmentPageSource.java`
 
-[`ArrowPageSource.java`](https://github.com/prestodb/presto/blob/master/presto-base-arrow-flight/src/main/java/com/facebook/plugin/arrow/ArrowPageSource.java) in `presto-base-arrow-flight` already implements the Arrow-batch-to-Presto-page loop (iterate batches, extract field vectors, call `ArrowBlockBuilder`, assemble Page, track completion). The difference is the data source (Lance Scanner vs. Flight stream), but the column-extraction and block-assembly loop is nearly identical. The ideal factoring is to extract the shared loop into a base class in `presto-base-arrow-flight`.
+[`ArrowPageSource.java`](https://github.com/prestodb/presto/blob/master/presto-base-arrow-flight/src/main/java/com/facebook/plugin/arrow/ArrowPageSource.java) in `presto-base-arrow-flight` already implements the Arrow-batch-to-Presto-page loop (iterate batches, extract field vectors, call `ArrowBlockBuilder`, assemble Page, track completion). The difference is the data source (Lance Scanner vs. Flight stream), but the column-extraction and block-assembly loop is nearly identical. The ideal factoring is to extract the shared loop into a base class in the new `presto-arrow-toolkit` module behind an `ArrowBatchStream` interface.
 
 ### C4. Java `ObjectOutputStream` serialization violates Presto development guidelines
 **File:** `LancePageSink.java`
@@ -196,8 +196,8 @@ Multiple concurrent splits create children named after the table name, making Ar
 | # | Severity | Location | Issue |
 |---|----------|----------|-------|
 | C1 | CRITICAL | `LanceErrorCode` | Error code base `0x0510_0000` collides with `ArrowErrorCode` |
-| C2 | CRITICAL | `LanceColumnHandle`, `LanceArrowToPageScanner` | Arrow↔Presto type mapping duplicates `ArrowBlockBuilder` in `presto-base-arrow-flight` |
-| C3 | CRITICAL | `LanceBasePageSource`, `LanceFragmentPageSource` | Page source duplicates `ArrowPageSource` structure |
+| C2 | CRITICAL | `LanceColumnHandle`, `LanceArrowToPageScanner` | Arrow↔Presto type mapping duplicates `ArrowBlockBuilder`; extract `presto-arrow-toolkit` (Appendix A) |
+| C3 | CRITICAL | `LanceBasePageSource`, `LanceFragmentPageSource` | Page source duplicates `ArrowPageSource` structure; ~610 lines eliminable via toolkit (Appendix A) |
 | C4 | CRITICAL | `LancePageSink` | Java `ObjectOutputStream` serialization violates Presto development guidelines |
 | 1 | HIGH | `LanceColumnHandle` | Array type hardcoded as `REAL` in single-arg overload |
 | 2 | HIGH | `LanceNamespaceHolder` | `schemaName` parameter silently ignored |
@@ -217,3 +217,161 @@ Multiple concurrent splits create children named after the table name, making Ar
 | 16 | LOW | `LanceNamespaceHolder` | Hand-rolled `deleteRecursively` |
 | 17 | LOW | `LanceArrowToPageScanner` | Swallowed `IOException` in `close()` |
 | 18 | LOW | Allocators | Non-unique names, unbounded ceiling |
+
+---
+
+## Appendix A: `presto-arrow-toolkit` Extraction Plan
+
+The Lance connector duplicates significant Arrow↔Presto conversion code from `presto-base-arrow-flight` (see C2, C3). However, depending on `presto-base-arrow-flight` directly would drag in `flight-core`, which transitively pulls in **gRPC 1.75.0 + Netty 4.1.130.Final** — a massive dependency footprint that Lance has no use for. Analysis confirms `presto-base-arrow-flight` is a leaf module (no other module in the monorepo depends on it), and the Arrow↔Presto conversion code has **zero `flight-core` imports**.
+
+The solution is to extract a lightweight `presto-arrow-toolkit` module that both `presto-base-arrow-flight` and `presto-lance` depend on.
+
+### Dependency structure
+
+```
+presto-arrow-toolkit (NEW — lightweight)
+  deps: arrow-vector, arrow-memory-core, presto-spi, presto-common,
+        airlift (configuration, bootstrap), guice, jackson, slice
+
+presto-base-arrow-flight (EXISTING — slimmed)
+  deps: presto-arrow-toolkit, flight-core (gRPC + Netty)
+
+presto-lance (NEW connector from this PR)
+  deps: presto-arrow-toolkit, lance-core
+        (NO flight-core, NO gRPC, NO Netty)
+```
+
+### New interfaces to create in `presto-arrow-toolkit` (3)
+
+```java
+/**
+ * Abstracts any source of Arrow record batches (Flight stream, Lance scanner,
+ * Parquet reader, etc.) so ArrowPageSource can consume them uniformly.
+ */
+public interface ArrowBatchStream extends AutoCloseable {
+    boolean next();
+    VectorSchemaRoot getRoot();
+    DictionaryProvider getDictionaryProvider();
+    void close();
+}
+
+/**
+ * Provides schema metadata for the connector's catalog.
+ * Decouples ArrowMetadata from BaseArrowFlightClientHandler.
+ */
+public interface ArrowMetadataProvider {
+    List<String> listSchemaNames(ConnectorSession session);
+    List<SchemaTableName> listTables(ConnectorSession session, Optional<String> schemaName);
+    Schema getSchemaForTable(ConnectorSession session, String schema, String table);
+}
+
+/**
+ * Factory for creating ArrowBatchStream instances from splits.
+ * Decouples ArrowPageSourceProvider from Flight client handler.
+ */
+public interface ArrowStreamProvider {
+    ArrowBatchStream getStream(ConnectorSession session, ArrowSplit split);
+}
+```
+
+### Files extracted from `presto-base-arrow-flight` → `presto-arrow-toolkit`
+
+#### Move as-is (10 files — zero Flight dependency)
+
+| File | What it does | Dependencies |
+|------|-------------|-------------|
+| `ArrowBlockBuilder.java` | Arrow FieldVector → Presto Block conversion + type mapping | `arrow-vector`, `presto-common`, `presto-spi`, `slice` |
+| `ArrowColumnHandle.java` | SPI `ColumnHandle` data class (columnName + columnType) | `presto-spi`, Jackson |
+| `ArrowTableHandle.java` | SPI `ConnectorTableHandle` (schema + table strings) | `presto-spi`, Jackson |
+| `ArrowTableLayoutHandle.java` | SPI `ConnectorTableLayoutHandle` with TupleDomain | `presto-spi`, `presto-common` |
+| `ArrowTransactionHandle.java` | Singleton enum `ConnectorTransactionHandle` | `presto-spi` |
+| `ArrowConnectorId.java` | Value class wrapping connector catalog name | None |
+| `ArrowErrorCode.java` | Error code enum (constant names say "FLIGHT" but no code dep) | `presto-common`, `presto-spi` |
+| `ArrowException.java` | `PrestoException` subclass using `ArrowErrorCode` | `presto-spi` |
+| `ArrowHandleResolver.java` | Returns `.class` for each handle type | `presto-spi` |
+| `ArrowPlugin.java` | `Plugin` impl, returns `ArrowConnectorFactory` | `presto-spi`, Guice |
+
+#### Move with refactoring (7 files — replace Flight types with new interfaces)
+
+| File | Change needed |
+|------|--------------|
+| `ArrowPageSource.java` | Replace `ClientClosingFlightStream` field → `ArrowBatchStream` interface. The `getNextPage()` loop already only calls `next()`, `getRoot()`, `getDictionaryProvider()` — all return `arrow-vector` types. |
+| `ArrowPageSourceProvider.java` | Replace `BaseArrowFlightClientHandler clientHandler` → `ArrowStreamProvider streamProvider`. The `createPageSource()` method calls `streamProvider.getStream(session, split)` instead of `clientHandler.getFlightStream(...)`. |
+| `ArrowMetadata.java` | Replace `BaseArrowFlightClientHandler clientHandler` → `ArrowMetadataProvider metadataProvider`. Arrow imports are only `org.apache.arrow.vector.types.pojo.{Field, Schema}` (from `arrow-vector`). |
+| `ArrowConnector.java` | Already programs to SPI interfaces (`ConnectorMetadata`, `ConnectorSplitManager`, etc.). Moves as-is. |
+| `ArrowConnectorFactory.java` | References `ArrowModule` — moves once the module is split. |
+| `ArrowModule.java` | Split into base `ArrowModule` (toolkit: binds `BufferAllocator`, `ArrowConnectorId`, `ArrowConnector`, `ArrowHandleResolver`, `ArrowBlockBuilder`, `ArrowMetadata`, `ArrowPageSourceProvider`) and `ArrowFlightModule` (flight: binds `ArrowFlightConfig`, `ArrowSplitManager`, `BaseArrowFlightClientHandler`). |
+| `ArrowSplit.java` | Rename `flightEndpointBytes` → `splitPayload` (generic opaque bytes). Flight module interprets bytes as `FlightEndpoint`; Lance module interprets them as fragment IDs. |
+
+#### Extract config base class (1 file)
+
+| File | Change needed |
+|------|--------------|
+| `ArrowFlightConfig.java` | Extract `ArrowConfig` base class into toolkit with transport-agnostic settings (`case-sensitive-name-matching`). `ArrowFlightConfig extends ArrowConfig` stays in flight module with server/port/SSL properties. |
+
+### Files that stay in `presto-base-arrow-flight` (3 + 2 new)
+
+| File | Why it stays |
+|------|-------------|
+| `BaseArrowFlightClientHandler.java` | Saturated with Flight imports (`FlightClient`, `FlightInfo`, `FlightDescriptor`, `Location`, TLS config via `grpcTls`). After extraction, implements `ArrowMetadataProvider` + `ArrowStreamProvider`. |
+| `ArrowSplitManager.java` | Calls `clientHandler.getFlightInfoForTableScan()` → `FlightInfo`, iterates `flightInfo.getEndpoints()` → `List<FlightEndpoint>`, serializes endpoints. Irreducibly Flight-specific. |
+| `ClientClosingFlightStream.java` | Wraps `org.apache.arrow.flight.FlightStream`. After extraction, implements `ArrowBatchStream`. |
+| `ArrowFlightConfig.java` (modified) | Extends toolkit's `ArrowConfig`, adds Flight server/port/SSL properties. |
+| `ArrowFlightModule.java` (new) | Extends toolkit's `ArrowModule`, binds Flight-specific implementations. |
+
+**Final tally:** 17 classes move to toolkit + 4 new abstractions created; 3 original files + 2 new files remain in flight module.
+
+### What the PR's Lance code should extract into `presto-arrow-toolkit`
+
+In addition to the `presto-base-arrow-flight` extractions above, three pieces of Lance-specific code in this PR contain **generic Arrow↔Presto logic** that should live in the toolkit (and replace the duplicated implementations):
+
+| PR file | Extractable piece | Toolkit destination | What stays in `presto-lance` |
+|---------|------------------|--------------------|-----------------------------|
+| `LanceColumnHandle.java` | Static methods `toPrestoType(ArrowType)`, `toPrestoType(Field)`, `toArrowType(Type)` — bidirectional Arrow↔Presto type mapping | Merge into `ArrowBlockBuilder`'s existing `getPrestoTypeFromArrowField()` (which already has richer coverage: Decimal, Map, Struct, Time, Duration, dictionary encoding) and add a new `getArrowTypeFromPrestoType(Type)` for the reverse direction | The `ColumnHandle` class itself (Lance-specific SPI boilerplate) |
+| `LancePageToArrowConverter.java` | Entire file — static utility methods `toArrowSchema(List<ColumnMetadata>)`, `writeBlockToVector(Block, FieldVector, Type, int)`, `writeBlockToVectorAtOffset(...)`. Handles boolean, tinyint, smallint, integer, bigint, real, double, varchar, varbinary, date, timestamp. **Zero Lance imports.** | New toolkit class `PrestoBlockToArrowWriter` (or add to `ArrowBlockBuilder` as the write direction). This is the cleanest extraction — the file has no Lance or Flight references at all. | Nothing — entire file moves |
+| `LanceArrowToPageScanner.java` | Methods `writeVectorToBlock(FieldVector, BlockBuilder, Type)` and `writeValue(...)` — per-row Arrow vector → Presto block writing for all supported types | Merge into `ArrowBlockBuilder`'s existing `buildBlockFromFieldVector()` which already does this. The existing implementation has broader type coverage. | The scanner lifecycle (`read()` method that calls `LanceScanner`), the `ScannerFactory` interface, and the `PageBuilder` orchestration |
+
+### What Lance should use from the toolkit instead of its own code
+
+After extraction, the Lance connector's read path becomes:
+
+```java
+// LanceFragmentPageSource — Lance-specific
+public class LanceFragmentPageSource extends ArrowPageSource {
+    // ArrowPageSource (from toolkit) handles the batch→page loop
+    // LanceBatchStream (Lance-specific) implements ArrowBatchStream
+}
+
+// LanceBatchStream — Lance-specific, implements toolkit interface
+public class LanceBatchStream implements ArrowBatchStream {
+    private final LanceScanner scanner;
+    private VectorSchemaRoot currentBatch;
+
+    public boolean next() { currentBatch = scanner.next(); return currentBatch != null; }
+    public VectorSchemaRoot getRoot() { return currentBatch; }
+    public DictionaryProvider getDictionaryProvider() { return /* ... */; }
+}
+```
+
+And the write path uses toolkit's `PrestoBlockToArrowWriter` directly instead of the duplicate `LancePageToArrowConverter`:
+
+```java
+// In LancePageSink.finish()
+Schema schema = PrestoBlockToArrowWriter.toArrowSchema(columns);
+PrestoBlockToArrowWriter.writeBlockToVector(block, vector, type, rowCount);
+// then Lance-specific: Fragment.create(allocator, tablePath, root);
+```
+
+### Summary of code elimination in this PR
+
+If `presto-arrow-toolkit` existed, the Lance PR could delete or significantly reduce:
+
+| File | Lines saved | Reason |
+|------|------------|--------|
+| `LanceArrowToPageScanner.java` | ~200 lines | Vector→Block conversion replaced by `ArrowBlockBuilder` |
+| `LancePageToArrowConverter.java` | ~180 lines (entire file) | Moves wholesale to toolkit |
+| `LanceColumnHandle.java` | ~100 lines | Type mapping methods replaced by toolkit's `ArrowBlockBuilder` |
+| `LanceBasePageSource.java` | ~80 lines | Page source loop replaced by `ArrowPageSource` from toolkit |
+| Type-dispatch in `LancePageSink.java` | ~50 lines | `writeBlockToVector` calls delegated to toolkit |
+
+**Total: ~610 lines of duplicated code eliminated**, replaced by dependency on shared, better-tested implementations with broader type coverage (Decimal, Map, Struct, Time, Duration, dictionary encoding — all missing from the Lance implementations).
