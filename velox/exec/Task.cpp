@@ -1791,12 +1791,14 @@ void Task::addExternalDynamicFilter(
     return;
   }
 
-  // Merge the filter into pipelineFilters. New data sources created via
-  // createDataSource() or preloaded splits will pick up the filter.
+  // Merge the filter into pipelineFilters and bump version so the TableScan
+  // operator (on the driver thread) knows to re-apply filters to its active
+  // data source.
   {
     auto lk = targetFilters->at(0).wlock();
     common::Filter::merge(filter, lk->filters[channel]);
     lk->dynamicFilteredColumns.insert(channel);
+    ++lk->externalFilterVersion;
   }
 }
 
