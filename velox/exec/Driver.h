@@ -335,10 +335,6 @@ struct PushdownFilters {
   /// Whether static filters has been added to filters.  This only needs to be
   /// done once per node by the first driver.
   bool staticFiltersInitialized = false;
-
-  /// Bumped when an external dynamic filter is merged. The TableScan operator
-  /// checks this to know when to re-apply filters to its active data source.
-  uint32_t externalFilterVersion = 0;
 };
 
 /// Pushdown filters on nodes in the pipeline.  Locks must be acquired in the

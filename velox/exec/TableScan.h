@@ -190,10 +190,5 @@ class TableScan : public SourceOperator {
   // The total number of raw input rows read up till the last finished split.
   // This is used to detect if a finished split is empty or not.
   uint64_t rawInputRowsSinceLastSplit_{0};
-
-  // Tracks the last externalFilterVersion seen from PushdownFilters. When
-  // this differs from the current version, we re-apply filters to the active
-  // data source.
-  uint32_t lastAppliedExternalFilterVersion_{0};
 };
 } // namespace facebook::velox::exec
