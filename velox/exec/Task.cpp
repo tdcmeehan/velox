@@ -1756,43 +1756,41 @@ void Task::addExternalDynamicFilter(
     const core::PlanNodeId& planNodeId,
     column_index_t channel,
     const common::FilterPtr& filter) {
-  // Use try_lock_for to avoid blocking indefinitely on the task mutex.
-  // This is a best-effort optimization; skipping a filter just means
-  // no row-group pruning for that particular column.
-  std::unique_lock<std::timed_mutex> l(mutex_, std::chrono::milliseconds(500));
-  if (!l.owns_lock() || !isRunningLocked()) {
-    return;
-  }
-
-  // Find the pipeline whose first plan node matches planNodeId (TableScan is
-  // always operator 0 in its pipeline).
-  for (auto pipeline = 0; pipeline < driverFactories_.size(); ++pipeline) {
-    auto& factory = driverFactories_[pipeline];
-    if (factory->planNodes.empty() ||
-        factory->planNodes[0]->id() != planNodeId) {
-      continue;
+  // Find the pipeline's pushdown filters under Task::mutex_, then release the
+  // mutex BEFORE acquiring the pipelineFilters wlock. This avoids a deadlock
+  // where our thread holds Task::mutex_ + waits for pipelineFilters wlock,
+  // while a driver thread holds pipelineFilters rlock + waits for Task::mutex_.
+  std::shared_ptr<PipelinePushdownFilters> targetFilters;
+  {
+    std::unique_lock<std::timed_mutex> l(
+        mutex_, std::chrono::milliseconds(500));
+    if (!l.owns_lock() || !isRunningLocked()) {
+      return;
     }
 
-    // Find any driver in this pipeline to access shared PipelinePushdownFilters.
-    for (auto& driver : drivers_) {
-      if (!driver || driver->driverCtx()->pipelineId != pipeline) {
+    for (auto pipeline = 0; pipeline < driverFactories_.size(); ++pipeline) {
+      auto& factory = driverFactories_[pipeline];
+      if (factory->planNodes.empty() ||
+          factory->planNodes[0]->id() != planNodeId) {
         continue;
       }
 
-      auto& pipelineFilters = driver->pushdownFilters();
-      if (!pipelineFilters || pipelineFilters->empty()) {
+      for (auto& driver : drivers_) {
+        if (!driver || driver->driverCtx()->pipelineId != pipeline) {
+          continue;
+        }
+        targetFilters = driver->pushdownFilters();
         break;
       }
-
-      // Operator 0 is the TableScan; merge the filter into its slot.
-      {
-        auto lk = pipelineFilters->at(0).wlock();
-        common::Filter::merge(filter, lk->filters[channel]);
-        lk->dynamicFilteredColumns.insert(channel);
-      }
-      return;
+      break;
     }
-    break;
+  } // Task::mutex_ released here.
+
+  // Merge the filter without holding Task::mutex_.
+  if (targetFilters && !targetFilters->empty()) {
+    auto lk = targetFilters->at(0).wlock();
+    common::Filter::merge(filter, lk->filters[channel]);
+    lk->dynamicFilteredColumns.insert(channel);
   }
 }
 
