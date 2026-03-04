@@ -1762,8 +1762,6 @@ void Task::addExternalDynamicFilter(
   // for pipelineFilters wlock, while a driver thread holds pipelineFilters
   // rlock + waits for Task::mutex_.
   std::shared_ptr<PipelinePushdownFilters> targetFilters;
-  // Keep the driver alive (shared_ptr) so we can safely access its operator.
-  std::shared_ptr<Driver> targetDriver;
   {
     std::unique_lock<std::timed_mutex> l(
         mutex_, std::chrono::milliseconds(500));
@@ -1783,7 +1781,6 @@ void Task::addExternalDynamicFilter(
           continue;
         }
         targetFilters = driver->pushdownFilters();
-        targetDriver = driver;
         break;
       }
       break;
@@ -1794,21 +1791,12 @@ void Task::addExternalDynamicFilter(
     return;
   }
 
-  // Merge the filter into pipelineFilters (for future splits/data sources).
+  // Merge the filter into pipelineFilters. The TableScan will pick up the
+  // filter when it initializes its next data source (via createDataSource()).
   {
     auto lk = targetFilters->at(0).wlock();
     common::Filter::merge(filter, lk->filters[channel]);
     lk->dynamicFilteredColumns.insert(channel);
-  }
-
-  // Notify the TableScan operator to apply the filter to its current data
-  // source. Without this, only future data sources would pick up the filter.
-  if (targetDriver) {
-    auto* scanOp = targetDriver->findOperatorNoThrow(0);
-    if (scanOp) {
-      auto lk = targetFilters->at(0).rlock();
-      scanOp->addDynamicFilterLocked(planNodeId, *lk);
-    }
   }
 }
 
