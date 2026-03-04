@@ -191,6 +191,21 @@ RowVectorPtr TableScan::getOutput() {
     const auto estimatedRowSize = dataSource_->estimatedRowSize();
     const int32_t readBatchSize = calculateBatchSize(estimatedRowSize);
 
+    // Check if an external dynamic filter was merged since we last checked.
+    // Apply it to the active data source on this (driver) thread.
+    {
+      auto lk = driverCtx_->driver->pushdownFilters()->at(0).rlock();
+      if (lk->externalFilterVersion != lastAppliedExternalFilterVersion_) {
+        lastAppliedExternalFilterVersion_ = lk->externalFilterVersion;
+        if (dataSource_) {
+          for (auto channel : lk->dynamicFilteredColumns) {
+            dataSource_->addDynamicFilter(
+                channel, lk->filters.at(channel));
+          }
+        }
+      }
+    }
+
     uint64_t ioTimeUs{0};
     std::optional<RowVectorPtr> dataOptional;
     {
