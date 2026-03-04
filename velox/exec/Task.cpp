@@ -1756,8 +1756,11 @@ void Task::addExternalDynamicFilter(
     const core::PlanNodeId& planNodeId,
     column_index_t channel,
     const common::FilterPtr& filter) {
-  std::lock_guard<std::timed_mutex> l(mutex_);
-  if (!isRunningLocked()) {
+  // Use try_lock_for to avoid blocking indefinitely on the task mutex.
+  // This is a best-effort optimization; skipping a filter just means
+  // no row-group pruning for that particular column.
+  std::unique_lock<std::timed_mutex> l(mutex_, std::chrono::milliseconds(500));
+  if (!l.owns_lock() || !isRunningLocked()) {
     return;
   }
 
