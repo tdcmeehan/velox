@@ -198,9 +198,16 @@ RowVectorPtr TableScan::getOutput() {
       if (lk->externalFilterVersion != lastAppliedExternalFilterVersion_) {
         lastAppliedExternalFilterVersion_ = lk->externalFilterVersion;
         if (dataSource_) {
+          int numApplied = 0;
           for (auto channel : lk->dynamicFilteredColumns) {
             dataSource_->addDynamicFilter(
                 channel, lk->filters.at(channel));
+            ++numApplied;
+          }
+          if (numApplied > 0) {
+            stats_.wlock()->addRuntimeStat(
+                "externalDynamicFiltersAppliedToScan",
+                RuntimeCounter(numApplied));
           }
         }
       }
