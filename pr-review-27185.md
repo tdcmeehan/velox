@@ -8,6 +8,40 @@ This PR introduces a new connector enabling Presto to read from and write to Lan
 
 ---
 
+## CRITICAL — Code Reuse
+
+### C1. `LanceErrorCode` base offset `0x0510_0000` COLLIDES with `ArrowErrorCode`
+**File:** `LanceErrorCode.java`
+
+```java
+errorCode = new ErrorCode(code + 0x0510_0000, name(), type);
+```
+
+`presto-base-arrow-flight`'s `ArrowErrorCode` uses the **exact same base offset** (`0x0510_0000`). `ArrowErrorCode` defines 7 constants (codes 0–6) and `LanceErrorCode` defines 4 constants (codes 0–3), so codes 0–3 collide numerically. Lance must choose a distinct, officially registered range (e.g., `0x0520_0000`), and both connectors should register their ranges in the [Error Codes wiki](https://github.com/prestodb/presto/wiki/Error-Codes).
+
+### C2. Arrow-Presto type mapping duplicates `presto-base-arrow-flight`'s `ArrowBlockBuilder`
+**Files:** `LanceColumnHandle.java`, `LanceArrowToPageScanner.java`
+
+`LanceColumnHandle.toPrestoType(ArrowType/Field)` and `LanceArrowToPageScanner`'s vector-to-block conversion duplicate the exact same work already done in [`ArrowBlockBuilder.java`](https://github.com/prestodb/presto/blob/master/presto-base-arrow-flight/src/main/java/com/facebook/plugin/arrow/ArrowBlockBuilder.java) in `presto-base-arrow-flight`:
+- `ArrowBlockBuilder.getPrestoTypeFromArrowField(Field)` — Arrow→Presto type mapping with richer coverage (Decimal, Map, Struct, Time, Duration, dictionary encoding)
+- `ArrowBlockBuilder.buildBlockFromFieldVector(FieldVector, Type, DictionaryProvider)` — vector→block conversion
+
+Every type handler in the Lance scanner (`BitVector`, `TinyIntVector`, `SmallIntVector`, `IntVector`, `BigIntVector`, `Float4Vector`, `Float8Vector`, `VarCharVector`, `VarBinaryVector`, `DateDayVector`, `TimeStampMicroVector`, `ListVector`, `FixedSizeListVector`) is duplicated.
+
+**Recommendation:** Depend on `presto-base-arrow-flight` and use `ArrowBlockBuilder` for type resolution and vector conversion. If Lance-specific extensions are needed, enhance the shared utility.
+
+### C3. `LanceFragmentPageSource`/`LanceBasePageSource` duplicate `ArrowPageSource` structure
+**Files:** `LanceBasePageSource.java`, `LanceFragmentPageSource.java`
+
+[`ArrowPageSource.java`](https://github.com/prestodb/presto/blob/master/presto-base-arrow-flight/src/main/java/com/facebook/plugin/arrow/ArrowPageSource.java) in `presto-base-arrow-flight` already implements the Arrow-batch-to-Presto-page loop (iterate batches, extract field vectors, call `ArrowBlockBuilder`, assemble Page, track completion). The difference is the data source (Lance Scanner vs. Flight stream), but the column-extraction and block-assembly loop is nearly identical. The ideal factoring is to extract the shared loop into a base class in `presto-base-arrow-flight`.
+
+### C4. Java `ObjectOutputStream` serialization violates Presto development guidelines
+**File:** `LancePageSink.java`
+
+The [Presto Development Guidelines](https://github.com/prestodb/presto/wiki/Presto-Development-Guidelines) explicitly state: **"Feel free to skip the section on Java serialization, as this is not used in Presto."** Every other connector uses Airlift's `JsonCodec<T>` for commit task data serialization. The Hive connector's `PartitionUpdate` pattern (`@JsonCreator`/`@JsonProperty` → `JsonCodec.toBytes()` → `Slices.wrappedBuffer()`) is the canonical example. `LanceCommitTaskData` already uses Jackson annotations — but then stores Base64-encoded Java-serialized `FragmentMetadata` objects inside it, violating the convention.
+
+---
+
 ## HIGH Severity
 
 ### 1. `toPrestoType(ArrowType)` hardcodes array element type as `REAL`
@@ -161,6 +195,10 @@ Multiple concurrent splits create children named after the table name, making Ar
 
 | # | Severity | Location | Issue |
 |---|----------|----------|-------|
+| C1 | CRITICAL | `LanceErrorCode` | Error code base `0x0510_0000` collides with `ArrowErrorCode` |
+| C2 | CRITICAL | `LanceColumnHandle`, `LanceArrowToPageScanner` | Arrow↔Presto type mapping duplicates `ArrowBlockBuilder` in `presto-base-arrow-flight` |
+| C3 | CRITICAL | `LanceBasePageSource`, `LanceFragmentPageSource` | Page source duplicates `ArrowPageSource` structure |
+| C4 | CRITICAL | `LancePageSink` | Java `ObjectOutputStream` serialization violates Presto development guidelines |
 | 1 | HIGH | `LanceColumnHandle` | Array type hardcoded as `REAL` in single-arg overload |
 | 2 | HIGH | `LanceNamespaceHolder` | `schemaName` parameter silently ignored |
 | 3 | HIGH | `LanceNamespaceHolder` | Static `RootAllocator` never closed, unbounded |
