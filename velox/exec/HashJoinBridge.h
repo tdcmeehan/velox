@@ -35,6 +35,14 @@ class HashJoinBridgeTestHelper;
 using HashJoinTableSpillFunc =
     std::function<SpillPartitionSet(std::shared_ptr<BaseHashTable>)>;
 
+/// Optional callback invoked when hash build completes, before
+/// prepareJoinTable() merges the per-driver hash tables. This allows reading
+/// VectorHasher discrete values before they are cleared by the merge.
+using HashTableReadyCallback = std::function<void(
+    const BaseHashTable& mainTable,
+    const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,
+    bool hasNullKeys)>;
+
 /// Hands over a hash table from a multi-threaded build pipeline to a
 /// multi-threaded probe pipeline. This is owned by shared_ptr by all the build
 /// and probe Operator instances concerned. Corresponds to the Presto concept of
@@ -71,6 +79,16 @@ class HashJoinBridge : public JoinBridge {
   void appendSpilledHashTablePartitions(SpillPartitionSet spillPartitionSet);
 
   void setAntiJoinHasNullKeys();
+
+  /// Registers an optional callback invoked when hash build completes.
+  void setHashTableReadyCallback(HashTableReadyCallback callback);
+
+  /// Fires the registered callback with pre-merge hash tables. Called by
+  /// HashBuild before prepareJoinTable() so discrete values are intact.
+  void fireHashTableReadyCallback(
+      const BaseHashTable& mainTable,
+      const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,
+      bool hasNullKeys);
 
   /// Represents the result of HashBuild operators. In case of an anti join, a
   /// build side entry with a null in a join key makes the join return nothing.
@@ -201,6 +219,9 @@ class HashJoinBridge : public JoinBridge {
   // in parallel, drivers call getAndIncrementClaimedRowContainerId() to ensure
   // the row containers they process do not overlap with each other.
   std::atomic_int unclaimedRowContainerId_{0};
+
+  /// Callback invoked when the hash table is ready.
+  HashTableReadyCallback hashTableReadyCallback_;
 
   friend test::HashJoinBridgeTestHelper;
 };

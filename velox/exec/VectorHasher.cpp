@@ -697,9 +697,34 @@ std::unique_ptr<common::Filter> VectorHasher::getFilter(
 
         return common::createBigintValues(values, nullAllowed);
       }
+      return nullptr;
+    case TypeKind::VARCHAR:
       [[fallthrough]];
+    case TypeKind::VARBINARY:
+      if (!distinctOverflow_) {
+        if (uniqueValues_.empty()) {
+          if (nullAllowed) {
+            return std::make_unique<common::IsNull>();
+          }
+          return std::make_unique<common::AlwaysFalse>();
+        }
+        std::vector<std::string> values;
+        values.reserve(uniqueValues_.size());
+        for (const auto& value : uniqueValues_) {
+          auto size = value.size();
+          if (size <= sizeof(int64_t)) {
+            auto data = value.data();
+            values.emplace_back(
+                reinterpret_cast<const char*>(&data), size);
+          } else {
+            values.emplace_back(
+                reinterpret_cast<const char*>(value.data()), size);
+          }
+        }
+        return std::make_unique<common::BytesValues>(values, nullAllowed);
+      }
+      return nullptr;
     default:
-      // TODO Add support for strings.
       return nullptr;
   }
 }

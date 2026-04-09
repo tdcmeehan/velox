@@ -244,6 +244,31 @@ void HashJoinBridge::setHashTable(
   notify(std::move(promises));
 }
 
+void HashJoinBridge::setHashTableReadyCallback(
+    HashTableReadyCallback callback) {
+  std::lock_guard<std::mutex> l(mutex_);
+  hashTableReadyCallback_ = std::move(callback);
+}
+
+void HashJoinBridge::fireHashTableReadyCallback(
+    const BaseHashTable& mainTable,
+    const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,
+    bool hasNullKeys) {
+  HashTableReadyCallback callback;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    callback = std::move(hashTableReadyCallback_);
+    hashTableReadyCallback_ = nullptr;
+  }
+  if (callback) {
+    try {
+      callback(mainTable, otherTables, hasNullKeys);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "Hash table ready callback failed: " << e.what();
+    }
+  }
+}
+
 void HashJoinBridge::setHashTable(
     std::shared_ptr<wave::HashTableHolder> table,
     bool hasNullKeys) {

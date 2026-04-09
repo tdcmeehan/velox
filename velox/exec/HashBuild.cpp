@@ -876,6 +876,12 @@ bool HashBuild::finishHashBuild() {
     pool()->release();
   };
 
+  // Fire hash table ready callback before prepareJoinTable(), which clears
+  // VectorHasher unique values via resetStats(). The callback can read
+  // discrete values from all per-driver hashers while they are still intact.
+  joinBridge_->fireHashTableReadyCallback(
+      *table_, otherTables, joinHasNullKeys_);
+
   // TODO: Re-enable parallel join build with spilling triggered after
   //  https://github.com/facebookincubator/velox/issues/3567 is fixed.
   CpuWallTiming timing;

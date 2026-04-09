@@ -350,6 +350,12 @@ class VectorHasher {
     return uniqueValues_.size();
   }
 
+  /// Returns true if distinct values overflowed (exceeded kMaxDistinct or
+  /// kMaxDistinctStringsBytes).
+  bool distinctOverflow() const {
+    return distinctOverflow_;
+  }
+
  private:
   static constexpr uint32_t kStringASRangeMaxSize = 7;
   static constexpr uint32_t kStringBufferUnitSize = 1024;

@@ -2342,13 +2342,23 @@ void Task::addHashJoinBridgesLocked(
     const std::vector<core::PlanNodeId>& planNodeIds) {
   auto& splitGroupState = splitGroupStates_[splitGroupId];
   for (const auto& planNodeId : planNodeIds) {
+    auto bridge = std::make_shared<HashJoinBridge>();
+    auto it = pendingHashJoinBridgeCallbacks_.find(planNodeId);
+    if (it != pendingHashJoinBridgeCallbacks_.end()) {
+      bridge->setHashTableReadyCallback(it->second);
+    }
     auto const inserted =
-        splitGroupState.bridges
-            .emplace(planNodeId, std::make_shared<HashJoinBridge>())
-            .second;
+        splitGroupState.bridges.emplace(planNodeId, std::move(bridge)).second;
     VELOX_CHECK(
         inserted, "Join bridge for node {} is already present", planNodeId);
   }
+}
+
+void Task::registerHashJoinBridgeCallback(
+    const core::PlanNodeId& planNodeId,
+    HashTableReadyCallback callback) {
+  std::lock_guard<std::timed_mutex> l(mutex_);
+  pendingHashJoinBridgeCallbacks_.emplace(planNodeId, std::move(callback));
 }
 
 void Task::addCustomJoinBridgesLocked(
