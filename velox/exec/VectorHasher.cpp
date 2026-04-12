@@ -612,6 +612,10 @@ template <>
 void VectorHasher::analyzeValue(StringView value) {
   int size = value.size();
   auto data = value.data();
+  // Track lexicographic string min/max unconditionally, independent of
+  // the int64 range used for normalized keys. This survives both
+  // rangeOverflow and distinctOverflow.
+  updateStringRange(std::string_view(data, size));
   if (!rangeOverflow_) {
     if (size > kStringASRangeMaxSize) {
       setRangeOverflow();
@@ -631,6 +635,20 @@ void VectorHasher::analyzeValue(StringView value) {
       }
       copyStringToLocal(&*pair.first);
     }
+  }
+}
+
+void VectorHasher::updateStringRange(std::string_view value) {
+  if (hasStringRange_) {
+    if (value < minString_) {
+      minString_ = value;
+    } else if (value > maxString_) {
+      maxString_ = value;
+    }
+  } else {
+    hasStringRange_ = true;
+    minString_ = value;
+    maxString_ = value;
   }
 }
 
@@ -894,6 +912,10 @@ void VectorHasher::copyStatsFrom(const VectorHasher& other) {
   min_ = other.min_;
   max_ = other.max_;
   uniqueValues_ = other.uniqueValues_;
+
+  hasStringRange_ = other.hasStringRange_;
+  minString_ = other.minString_;
+  maxString_ = other.maxString_;
 }
 
 void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
@@ -913,6 +935,19 @@ void VectorHasher::merge(const VectorHasher& other, size_t maxNumDistinct) {
     max_ = std::max(max_, other.max_);
   } else {
     setRangeOverflow();
+  }
+  // Merge lexicographic string min/max.
+  if (hasStringRange_ && other.hasStringRange_) {
+    if (other.minString_ < minString_) {
+      minString_ = other.minString_;
+    }
+    if (other.maxString_ > maxString_) {
+      maxString_ = other.maxString_;
+    }
+  } else if (other.hasStringRange_) {
+    hasStringRange_ = true;
+    minString_ = other.minString_;
+    maxString_ = other.maxString_;
   }
   if (distinctOverflow_) {
     return;

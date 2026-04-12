@@ -341,7 +341,7 @@ class VectorHasher {
 
   // true if no values have been added.
   bool empty() const {
-    return !hasRange_ && uniqueValues_.empty();
+    return !hasRange_ && !hasStringRange_ && uniqueValues_.empty();
   }
 
   std::string toString() const;
@@ -354,6 +354,43 @@ class VectorHasher {
   /// kMaxDistinctStringsBytes).
   bool distinctOverflow() const {
     return distinctOverflow_;
+  }
+
+  /// Returns true if the int64 range has been initialized (min/max valid).
+  bool hasRange() const {
+    return hasRange_;
+  }
+
+  /// Returns true if range tracking overflowed (strings > 7 bytes).
+  bool rangeOverflow() const {
+    return rangeOverflow_;
+  }
+
+  /// Returns the minimum value seen. Only valid when hasRange() is true.
+  int64_t min() const {
+    return min_;
+  }
+
+  /// Returns the maximum value seen. Only valid when hasRange() is true.
+  int64_t max() const {
+    return max_;
+  }
+
+  /// Returns true if lexicographic string min/max have been recorded.
+  bool hasStringRange() const {
+    return hasStringRange_;
+  }
+
+  /// Returns the lexicographic minimum string seen.
+  /// Only valid when hasStringRange() is true.
+  const std::string& minString() const {
+    return minString_;
+  }
+
+  /// Returns the lexicographic maximum string seen.
+  /// Only valid when hasStringRange() is true.
+  const std::string& maxString() const {
+    return maxString_;
   }
 
  private:
@@ -629,6 +666,14 @@ class VectorHasher {
   // Bounds of the range if 'isRange_' is true.
   int64_t min_ = 1;
   int64_t max_ = 0;
+
+  // Lexicographic min/max of all string values seen. Independent of the
+  // int64 range tracking used for normalized keys.
+  std::string minString_;
+  std::string maxString_;
+  bool hasStringRange_{false};
+
+  void updateStringRange(std::string_view value);
   // Table for mapping distinct values to small ints.
   folly::F14FastSet<UniqueValue, UniqueValueHasher, UniqueValueComparer>
       uniqueValues_;
