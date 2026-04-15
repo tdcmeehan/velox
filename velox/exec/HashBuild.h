@@ -24,9 +24,31 @@
 #include "velox/exec/Spill.h"
 #include "velox/exec/Spiller.h"
 #include "velox/exec/UnorderedStreamReader.h"
+#include "velox/type/Variant.h"
 
 namespace facebook::velox::exec {
 class HashBuildSpiller;
+
+/// Result of extracting a dynamic filter from a per-driver VectorHasher.
+/// Contains either discrete values (via filter) or range bounds (via
+/// rangeMin/rangeMax) when discrete tracking overflowed.
+struct HashBuildFilterResult {
+  /// The discrete-value filter from VectorHasher::getFilter(). Null when
+  /// distinct tracking overflowed (too many unique values or too much
+  /// string storage). The caller should fall back to rangeMin/rangeMax.
+  std::unique_ptr<common::Filter> filter;
+
+  /// True when VectorHasher's distinct tracking overflowed.
+  bool distinctOverflow{false};
+
+  /// Min/max range bounds as correctly-typed variants (e.g., variant(int32_t)
+  /// for INTEGER, variant(string) for VARCHAR). Present when VectorHasher
+  /// tracked range data. For integer types this comes from the int64 range;
+  /// for VARCHAR/VARBINARY from lexicographic string tracking. Empty when
+  /// the type doesn't support range tracking or no values were seen.
+  std::optional<variant> rangeMin;
+  std::optional<variant> rangeMax;
+};
 
 /// Builds a hash table for use in HashProbe. This is the final
 /// Operator in a build side Driver. The build side pipeline has
@@ -87,6 +109,14 @@ class HashBuild final : public Operator {
 
   bool isFinished() override;
 
+  /// Returns the dynamic filter for the given build-side column channel.
+  /// Reads the per-driver VectorHasher state (discrete values, min/max
+  /// range) which is populated during addInput and intact until
+  /// prepareJoinTable clears it. Returns std::nullopt if no hasher
+  /// exists for the given channel.
+  std::optional<HashBuildFilterResult> getFilterForChannel(
+      column_index_t channel) const;
+
   bool canReclaim() const override;
 
   void reclaim(uint64_t targetBytes, memory::MemoryReclaimer::Stats& stats)
@@ -104,6 +134,15 @@ class HashBuild final : public Operator {
 
   const std::shared_ptr<HashJoinBridge>& joinBridge() const {
     return joinBridge_;
+  }
+
+  /// Registers an optional callback invoked per driver at the beginning of
+  /// noMoreInput(), before finishHashBuild runs. At this point the per-driver
+  /// hash table and its VectorHasher state are fully populated from addInput
+  /// but not yet merged or cleared by prepareJoinTable.
+  void setNoMoreInputCallback(
+      std::function<void(const HashBuild&)> callback) {
+    noMoreInputCallback_ = std::move(callback);
   }
 
  private:
@@ -294,6 +333,10 @@ class HashBuild final : public Operator {
   std::shared_ptr<HashJoinBridge> joinBridge_;
 
   tsan_atomic<bool> exceededMaxSpillLevelLimit_{false};
+
+  /// Optional per-driver callback fired in noMoreInput before
+  /// finishHashBuild. See setNoMoreInputCallback.
+  std::function<void(const HashBuild&)> noMoreInputCallback_;
 
   State state_{State::kRunning};
 

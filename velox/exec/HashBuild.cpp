@@ -753,6 +753,16 @@ void HashBuild::noMoreInput() {
     return;
   }
 
+  // Fire per-driver callback before finishHashBuild. At this point the
+  // hash table's VectorHasher state is fully populated from addInput.
+  if (noMoreInputCallback_) {
+    try {
+      noMoreInputCallback_(*this);
+    } catch (const std::exception& e) {
+      LOG(ERROR) << "noMoreInputCallback failed: " << e.what();
+    }
+  }
+
   Operator::noMoreInput();
 
   noMoreInputInternal();
@@ -876,9 +886,9 @@ bool HashBuild::finishHashBuild() {
     pool()->release();
   };
 
-  // Fire hash table ready callback before prepareJoinTable(), which clears
-  // VectorHasher unique values via resetStats(). The callback can read
-  // discrete values from all per-driver hashers while they are still intact.
+  // TODO(removable-bridge-callback): This fires only from the last driver
+  // after allPeersFinished. For DPP, Presto C++ now fires per-driver instead.
+  // Remove this call (and the bridge callback mechanism) once confirmed.
   joinBridge_->fireHashTableReadyCallback(
       *table_, otherTables, joinHasNullKeys_);
 
@@ -1379,6 +1389,55 @@ void HashBuild::close() {
     spiller_.reset();
     table_.reset();
   }
+}
+
+namespace {
+/// Converts a VectorHasher's int64 min/max to a correctly-typed variant
+/// matching the column's logical type (e.g., int32 for INTEGER).
+variant toTypedVariant(int64_t value, TypeKind kind) {
+  switch (kind) {
+    case TypeKind::INTEGER:
+      return variant(static_cast<int32_t>(value));
+    case TypeKind::SMALLINT:
+      return variant(static_cast<int16_t>(value));
+    case TypeKind::TINYINT:
+      return variant(static_cast<int8_t>(value));
+    default:
+      return variant(value); // BIGINT, DATE, TIMESTAMP
+  }
+}
+} // namespace
+
+std::optional<HashBuildFilterResult> HashBuild::getFilterForChannel(
+    column_index_t channel) const {
+  if (!table_) {
+    return std::nullopt;
+  }
+  const VectorHasher* hasher = nullptr;
+  for (const auto& h : table_->hashers()) {
+    if (h->channel() == channel) {
+      hasher = h.get();
+      break;
+    }
+  }
+  if (!hasher) {
+    return std::nullopt;
+  }
+
+  HashBuildFilterResult result;
+  result.filter = hasher->getFilter(false);
+  result.distinctOverflow = hasher->distinctOverflow();
+
+  // Populate range bounds from VectorHasher's tracked min/max.
+  if (hasher->hasRange() && !hasher->rangeOverflow()) {
+    result.rangeMin = toTypedVariant(hasher->min(), hasher->typeKind());
+    result.rangeMax = toTypedVariant(hasher->max(), hasher->typeKind());
+  } else if (hasher->hasStringRange()) {
+    result.rangeMin = variant(hasher->minString());
+    result.rangeMax = variant(hasher->maxString());
+  }
+
+  return result;
 }
 
 HashBuildSpiller::HashBuildSpiller(

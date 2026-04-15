@@ -554,8 +554,9 @@ class Task : public std::enable_shared_from_this<Task> {
       std::vector<ContinuePromise>& promises,
       std::vector<std::shared_ptr<Driver>>& peers);
 
-  /// Registers a callback invoked when the hash table is set on the
-  /// HashJoinBridge for the given plan node. Must be called before start().
+  /// TODO(removable-bridge-callback): See note on HashTableReadyCallback in
+  /// HashJoinBridge.h. Remove this method and pendingHashJoinBridgeCallbacks_
+  /// once the per-driver approach is confirmed.
   void registerHashJoinBridgeCallback(
       const core::PlanNodeId& planNodeId,
       HashTableReadyCallback callback);
@@ -1372,6 +1373,7 @@ class Task : public std::enable_shared_from_this<Task> {
 
   // Callbacks registered before start() to be applied to HashJoinBridges when
   // they are created in addHashJoinBridgesLocked().
+  // TODO(removable-bridge-callback): See note on HashTableReadyCallback.
   std::unordered_map<core::PlanNodeId, HashTableReadyCallback>
       pendingHashJoinBridgeCallbacks_;
 

@@ -189,6 +189,13 @@ OperatorSupplier makeOperatorSupplier(
 
   if (auto join =
           std::dynamic_pointer_cast<const core::HashJoinNode>(planNode)) {
+    // Check registered translators first. This allows the Presto layer
+    // to intercept HashBuild creation (e.g., to set a per-driver
+    // noMoreInput callback for dynamic filter extraction).
+    auto customSupplier = Operator::operatorSupplierFromPlanNode(planNode);
+    if (customSupplier) {
+      return customSupplier;
+    }
     return [join](int32_t operatorId, DriverCtx* ctx) {
       if (ctx->task->hasMixedExecutionGroupJoin(join.get()) &&
           needRightSideJoin(join->joinType())) {

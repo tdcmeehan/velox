@@ -38,6 +38,17 @@ using HashJoinTableSpillFunc =
 /// Optional callback invoked when hash build completes, before
 /// prepareJoinTable() merges the per-driver hash tables. This allows reading
 /// VectorHasher discrete values before they are cleared by the merge.
+///
+/// TODO(removable-bridge-callback): This bridge-level callback fires only
+/// from the last driver (after allPeersFinished in finishHashBuild). For
+/// distributed dynamic partition pruning (DPP), Presto C++ now uses a
+/// per-driver approach instead (wrapping HashBuild to fire on each driver's
+/// noMoreInput). If the per-driver approach is confirmed working in
+/// production, this callback type, setHashTableReadyCallback,
+/// fireHashTableReadyCallback, hashTableReadyCallback_ member,
+/// Task::registerHashJoinBridgeCallback, Task::pendingHashJoinBridgeCallbacks_,
+/// and the fireHashTableReadyCallback call in HashBuild::finishHashBuild can
+/// all be removed.
 using HashTableReadyCallback = std::function<void(
     const BaseHashTable& mainTable,
     const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,
@@ -80,11 +91,10 @@ class HashJoinBridge : public JoinBridge {
 
   void setAntiJoinHasNullKeys();
 
-  /// Registers an optional callback invoked when hash build completes.
+  /// TODO(removable-bridge-callback): See note on HashTableReadyCallback.
   void setHashTableReadyCallback(HashTableReadyCallback callback);
 
-  /// Fires the registered callback with pre-merge hash tables. Called by
-  /// HashBuild before prepareJoinTable() so discrete values are intact.
+  /// TODO(removable-bridge-callback): See note on HashTableReadyCallback.
   void fireHashTableReadyCallback(
       const BaseHashTable& mainTable,
       const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,
@@ -220,7 +230,7 @@ class HashJoinBridge : public JoinBridge {
   // the row containers they process do not overlap with each other.
   std::atomic_int unclaimedRowContainerId_{0};
 
-  /// Callback invoked when the hash table is ready.
+  /// TODO(removable-bridge-callback): See note on HashTableReadyCallback.
   HashTableReadyCallback hashTableReadyCallback_;
 
   friend test::HashJoinBridgeTestHelper;
