@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <folly/Synchronized.h>
 #include <folly/container/IntrusiveList.h>
 
 #include "velox/common/base/SkewedPartitionBalancer.h"
@@ -1238,6 +1239,16 @@ class Task : public std::enable_shared_from_this<Task> {
   std::vector<std::unique_ptr<DriverFactory>> driverFactories_;
   std::vector<std::shared_ptr<Driver>> drivers_;
   std::unordered_map<core::PlanNodeId, uint32_t> numDriversPerLeafNode_;
+
+  // Maps a pipeline's leaf plan node id to that pipeline's pushdown filters.
+  // Populated when drivers are created (under Task::mutex_) and read by
+  // addExternalDynamicFilter without taking Task::mutex_, since the mapping
+  // is invariant for the task's lifetime. Under grouped execution the first
+  // split group wins, matching the prior driver-walk behavior.
+  folly::Synchronized<std::unordered_map<
+      core::PlanNodeId,
+      std::shared_ptr<PipelinePushdownFilters>>>
+      externalDynamicFilterTargets_;
 
   // Tracks the blocking state for each driver under serialized execution mode.
   class DriverBlockingState {

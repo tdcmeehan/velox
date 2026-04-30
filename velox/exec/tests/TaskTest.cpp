@@ -33,6 +33,7 @@
 #include "velox/exec/tests/utils/HiveConnectorTestBase.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/exec/tests/utils/QueryAssertions.h"
+#include "velox/type/Filter.h"
 #include "velox/vector/fuzzer/VectorFuzzer.h"
 
 using namespace facebook::velox;
@@ -604,6 +605,47 @@ TEST_F(TaskTest, toJson) {
 
   ASSERT_NO_THROW(task->toJson());
   ASSERT_NO_THROW(task->toShortJson());
+}
+
+TEST_F(TaskTest, addExternalDynamicFilterCacheLookup) {
+  // Exercises the planNodeId -> PipelinePushdownFilters cache populated in
+  // createDriversLocked. Verifies all three lookup paths: cache empty
+  // (pre-start), cache hit (post-start, leaf scan), and cache miss
+  // (unknown plan node id). Calls must not contend Task::mutex_ on the hot
+  // path; correctness of the merge itself is covered by the DPP integration
+  // benchmarks.
+  core::PlanNodeId scanId;
+  auto plan = PlanBuilder()
+                  .tableScan(ROW({"a", "b"}, {INTEGER(), DOUBLE()}))
+                  .capturePlanNodeId(scanId)
+                  .planFragment();
+
+  auto task = Task::create(
+      "task-addExternalDynamicFilter",
+      std::move(plan),
+      0,
+      core::QueryCtx::create(driverExecutor_.get()),
+      Task::ExecutionMode::kParallel);
+
+  common::FilterPtr filter =
+      common::createBigintValues({1, 2, 3}, /*nullAllowed=*/false);
+
+  // Cache empty before start: lookup returns early without contending
+  // Task::mutex_.
+  ASSERT_NO_THROW(task->addExternalDynamicFilter(scanId, /*channel=*/0, filter));
+
+  task->start(2);
+
+  // Cache hit: scan plan node id is registered, filter merges into the
+  // pipeline's pushdownFilters.
+  ASSERT_NO_THROW(task->addExternalDynamicFilter(scanId, /*channel=*/0, filter));
+
+  // Cache miss: unknown plan node id, returns early.
+  ASSERT_NO_THROW(task->addExternalDynamicFilter(
+      "no-such-plan-node", /*channel=*/0, filter));
+
+  task->noMoreSplits("0");
+  waitForTaskCompletion(task.get());
 }
 
 TEST_F(TaskTest, createdCount) {

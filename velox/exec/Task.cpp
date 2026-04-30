@@ -460,6 +460,7 @@ Task::~Task() {
   CLEAR(splitsStates_.clear());
   CLEAR(drivers_.clear());
   CLEAR(driverFactories_.clear());
+  CLEAR(externalDynamicFilterTargets_.wlock()->clear());
   CLEAR(onError_ = [](std::exception_ptr) {});
   CLEAR(exchangeClientByPlanNode_.clear());
   CLEAR(exchangeClients_.clear());
@@ -1344,6 +1345,13 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
     const uint32_t driverIdOffset =
         factory->numDrivers * (groupedExecutionDrivers ? splitGroupId : 0);
     auto filters = std::make_shared<PipelinePushdownFilters>();
+    if (!factory->planNodes.empty()) {
+      // Cache for lock-free lookup in addExternalDynamicFilter. Use
+      // try_emplace so the first split group's filters win, matching the
+      // existing driver-walk semantics under grouped execution.
+      externalDynamicFilterTargets_.wlock()->try_emplace(
+          factory->planNodes[0]->id(), filters);
+    }
     for (uint32_t partitionId = 0; partitionId < factory->numDrivers;
          ++partitionId) {
       drivers.emplace_back(factory->createDriver(
@@ -1756,36 +1764,18 @@ void Task::addExternalDynamicFilter(
     const core::PlanNodeId& planNodeId,
     column_index_t channel,
     const common::FilterPtr& filter) {
-  // Find the pipeline's pushdown filters and the TableScan operator under
-  // Task::mutex_, then release the mutex BEFORE acquiring pipelineFilters
-  // locks. This avoids a deadlock where our thread holds Task::mutex_ + waits
-  // for pipelineFilters wlock, while a driver thread holds pipelineFilters
-  // rlock + waits for Task::mutex_.
+  // Look up the target pipeline's pushdown filters from the cache populated
+  // at driver creation. This avoids contending Task::mutex_ on the hot path
+  // when many filters arrive concurrently from the coordinator.
   std::shared_ptr<PipelinePushdownFilters> targetFilters;
   {
-    std::unique_lock<std::timed_mutex> l(
-        mutex_, std::chrono::milliseconds(500));
-    if (!l.owns_lock() || !isRunningLocked()) {
+    auto rlk = externalDynamicFilterTargets_.rlock();
+    auto it = rlk->find(planNodeId);
+    if (it == rlk->end()) {
       return;
     }
-
-    for (auto pipeline = 0; pipeline < driverFactories_.size(); ++pipeline) {
-      auto& factory = driverFactories_[pipeline];
-      if (factory->planNodes.empty() ||
-          factory->planNodes[0]->id() != planNodeId) {
-        continue;
-      }
-
-      for (auto& driver : drivers_) {
-        if (!driver || driver->driverCtx()->pipelineId != pipeline) {
-          continue;
-        }
-        targetFilters = driver->pushdownFilters();
-        break;
-      }
-      break;
-    }
-  } // Task::mutex_ released here.
+    targetFilters = it->second;
+  }
 
   if (!targetFilters || targetFilters->empty()) {
     return;
@@ -1793,13 +1783,12 @@ void Task::addExternalDynamicFilter(
 
   // Merge the filter into pipelineFilters and bump version so the TableScan
   // operator (on the driver thread) knows to re-apply filters to its active
-  // data source.
-  {
-    auto lk = targetFilters->at(0).wlock();
-    common::Filter::merge(filter, lk->filters[channel]);
-    lk->dynamicFilteredColumns.insert(channel);
-    ++lk->externalFilterVersion;
-  }
+  // data source. Writing after task termination is benign: the filter object
+  // stays alive via shared_ptr and no driver will read it.
+  auto lk = targetFilters->at(0).wlock();
+  common::Filter::merge(filter, lk->filters[channel]);
+  lk->dynamicFilteredColumns.insert(channel);
+  ++lk->externalFilterVersion;
 }
 
 void Task::setSplitsStore(
