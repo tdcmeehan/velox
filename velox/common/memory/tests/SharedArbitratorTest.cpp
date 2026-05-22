@@ -32,6 +32,7 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/HashAggregation.h"
+#include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/TableWriter.h"
 #include "velox/exec/Values.h"
@@ -1402,6 +1403,138 @@ TEST_P(
     waitForAllTasksToBeDeleted();
     ASSERT_GT(arbitrator_->stats().numRequests, 0);
   }
+}
+
+// Reproduces the contract failure that Task::registerHashJoinBridgeCallback's
+// firing-site suspend wrap is intended to prevent.
+//
+// The bridge callback fires from the last HashBuild driver inside
+// finishHashBuild, on-thread. The production Prestissimo pattern is for the
+// callback to allocate from an arbitrator-tracked task-child memory pool.
+// When that allocation has to grow the pool's capacity, the arbitrator
+// reclaims from existing participants — including the participant that owns
+// the allocating pool. Reclaiming from a Task pool walks through
+// Task::MemoryReclaimer::reclaimTask, which calls requestPause().wait() to
+// drain the task's drivers before touching its operators. The very driver
+// firing the callback is on-thread, so without the suspend wrap
+// requestPause().wait() blocks forever — observed in this test as the
+// 30-second timeout below.
+//
+// With the suspend wrap around fireHashTableReadyCallback, the firing
+// driver is in suspended state for the duration of the callback;
+// requestPause().wait() finds it already off-thread; arbitration's
+// reclaim path completes; the allocation either succeeds or fails cleanly;
+// the task makes forward progress.
+TEST_P(
+    SharedArbitrationTestWithThreadingModes,
+    hashJoinBridgeCallbackAllocationTriggersReclaim) {
+  if (isSerialExecutionMode_) {
+    // Bridge callback path is exercised by the parallel HashBuild
+    // allPeersFinished gather-then-fire flow, which kSerial mode doesn't
+    // reach.
+    GTEST_SKIP();
+  }
+  // Tight per-pool init capacity (1 MB) so the callback's allocation
+  // immediately needs to grow capacity, forcing the arbitrator into the
+  // reclaim path.
+  setupMemory(/*memoryCapacity=*/256L << 20, /*memoryPoolInitCapacity=*/1L << 20);
+  // Allocation size that comfortably exceeds the per-pool init capacity,
+  // ensuring arbitration is invoked rather than a fast-path
+  // growCapacity().
+  const int64_t bridgeAllocationSize = 64L << 20; // 64 MB
+
+  std::vector<RowVectorPtr> joinInput;
+  joinInput.reserve(8);
+  VectorFuzzer::Options opts;
+  opts.vectorSize = 1024;
+  VectorFuzzer fuzzer(opts, pool_.get());
+  const auto joinRowType = ROW({"k", "v"}, {BIGINT(), BIGINT()});
+  for (int i = 0; i < 8; ++i) {
+    joinInput.push_back(fuzzer.fuzzRow(joinRowType));
+  }
+
+  auto joinQueryCtx =
+      newQueryCtx(memoryManager_.get(), executor_.get(), kMemoryCapacity);
+
+  core::PlanNodeId joinNodeId;
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan =
+      PlanBuilder(planNodeIdGenerator)
+          .values(joinInput, true)
+          .hashJoin(
+              {"k"},
+              {"u_k"},
+              PlanBuilder(planNodeIdGenerator)
+                  .values(joinInput, true)
+                  .project({"k AS u_k", "v AS u_v"})
+                  .planNode(),
+              "",
+              {"k", "v"},
+              core::JoinType::kInner)
+          .capturePlanNodeId(joinNodeId)
+          .planFragment();
+
+  auto task = Task::create(
+      "hashJoinBridgeCallbackAllocationTriggersReclaim",
+      std::move(plan),
+      0,
+      joinQueryCtx,
+      Task::ExecutionMode::kParallel,
+      [](RowVectorPtr /*data*/,
+         bool /*drained*/,
+         ContinueFuture* /*future*/) { return BlockingReason::kNotBlocked; });
+
+  std::atomic<bool> callbackFired{false};
+  std::atomic<bool> sawSuspendedDriver{false};
+  std::atomic<bool> allocationCompleted{false};
+
+  task->registerHashJoinBridgeCallback(
+      joinNodeId,
+      [&](const BaseHashTable& /*mainTable*/,
+          const std::vector<std::unique_ptr<BaseHashTable>>& /*otherTables*/,
+          bool /*hasNullKeys*/) {
+        callbackFired = true;
+        auto* threadCtx = driverThreadContext();
+        ASSERT_NE(threadCtx, nullptr);
+        sawSuspendedDriver =
+            threadCtx->driverCtx()->driver->state().suspended();
+        // Allocate from a task-child pool — the production Prestissimo
+        // DPP pattern. With this size > init capacity the arbitrator is
+        // forced to engage and Task::MemoryReclaimer::reclaimTask runs,
+        // calling requestPause().wait() on this task. Without the
+        // suspend wrap, the very driver running this lambda is on-thread,
+        // so requestPause never completes. The allocation itself may or
+        // may not succeed depending on what the arbitrator can reclaim —
+        // what we assert below is that the task makes forward progress
+        // (completes within the 30s timeout), proving no deadlock.
+        auto leafPool =
+            task->pool()->addLeafChild("bridge-callback-alloc-pool");
+        try {
+          void* buf = leafPool->allocate(bridgeAllocationSize);
+          leafPool->free(buf, bridgeAllocationSize);
+        } catch (const VeloxException&) {
+          // Arbitrator couldn't grow capacity enough — that's fine for
+          // this test, the contract assertion is about progress not
+          // success.
+        }
+        allocationCompleted = true;
+      });
+
+  task->start(2, 1);
+
+  ASSERT_TRUE(waitForTaskCompletion(task.get(), 30'000'000))
+      << "Task did not complete within 30s — the suspended-driver "
+         "contract around fireHashTableReadyCallback is broken; "
+         "Task::MemoryReclaimer::reclaimTask deadlocked on "
+         "requestPause().wait() because the bridge-callback driver "
+         "was on-thread";
+
+  EXPECT_TRUE(callbackFired);
+  EXPECT_TRUE(sawSuspendedDriver);
+  EXPECT_TRUE(allocationCompleted);
+
+  task.reset();
+  waitForAllTasksToBeDeleted();
 }
 
 TEST_P(SharedArbitrationTestWithThreadingModes, reserveReleaseCounters) {

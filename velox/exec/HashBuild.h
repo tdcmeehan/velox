@@ -181,6 +181,15 @@ class HashBuild final : public Operator {
   // merged from all the other drivers.
   bool finishHashBuild();
 
+  // Suspends the driver, fires the bridge's hash-table-ready callback (with
+  // 'otherTables' as the peer hash tables), and resumes. Called from
+  // finishHashBuild() before prepareJoinTable() so the callback may
+  // allocate from arbitrator-tracked task-child pools safely. A RAII guard
+  // ensures the driver is resumed on every exit path including the
+  // firing-site swallowing a callback exception.
+  void fireHashTableReadyCallbackSuspended(
+      const std::vector<std::unique_ptr<BaseHashTable>>& otherTables);
+
   // Invoked after the hash table has been built. It waits for any spill data to
   // process after the probe side has finished processing the previously built
   // hash table. If disk spilling is not enabled or there is no more spill data,

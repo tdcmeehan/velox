@@ -95,6 +95,9 @@ class HashJoinBridge : public JoinBridge {
   void setHashTableReadyCallback(HashTableReadyCallback callback);
 
   /// TODO(removable-bridge-callback): See note on HashTableReadyCallback.
+  bool hasHashTableReadyCallback();
+
+  /// TODO(removable-bridge-callback): See note on HashTableReadyCallback.
   void fireHashTableReadyCallback(
       const BaseHashTable& mainTable,
       const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,

@@ -250,6 +250,11 @@ void HashJoinBridge::setHashTableReadyCallback(
   hashTableReadyCallback_ = std::move(callback);
 }
 
+bool HashJoinBridge::hasHashTableReadyCallback() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return hashTableReadyCallback_ != nullptr;
+}
+
 void HashJoinBridge::fireHashTableReadyCallback(
     const BaseHashTable& mainTable,
     const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,

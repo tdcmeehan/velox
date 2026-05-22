@@ -56,6 +56,7 @@ add_executable(
   FunctionResolutionTest.cpp
   HashBitRangeTest.cpp
   HashJoinBridgeTest.cpp
+  HashJoinBridgeCallbackTest.cpp
   HashJoinTest.cpp
   HashPartitionFunctionTest.cpp
   HashTableTest.cpp

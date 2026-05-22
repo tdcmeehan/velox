@@ -889,8 +889,7 @@ bool HashBuild::finishHashBuild() {
   // TODO(removable-bridge-callback): This fires only from the last driver
   // after allPeersFinished. For DPP, Presto C++ now fires per-driver instead.
   // Remove this call (and the bridge callback mechanism) once confirmed.
-  joinBridge_->fireHashTableReadyCallback(
-      *table_, otherTables, joinHasNullKeys_);
+  fireHashTableReadyCallbackSuspended(otherTables);
 
   // TODO: Re-enable parallel join build with spilling triggered after
   //  https://github.com/facebookincubator/velox/issues/3567 is fixed.
@@ -1518,6 +1517,23 @@ void HashBuild::abandonHashBuildDedup() {
   abandonHashBuildDedup_ = true;
   table_->setAllowDuplicates(true);
   lookup_.reset();
+}
+
+void HashBuild::fireHashTableReadyCallbackSuspended(
+    const std::vector<std::unique_ptr<BaseHashTable>>& otherTables) {
+  if (!joinBridge_->hasHashTableReadyCallback()) {
+    return;
+  }
+  auto* driver = operatorCtx_->driver();
+  auto* task = operatorCtx_->task().get();
+  const auto stopReason = task->enterSuspended(driver->state());
+  if (stopReason != StopReason::kNone) {
+    return;
+  }
+  auto guard =
+      folly::makeGuard([&]() { task->leaveSuspended(driver->state()); });
+  joinBridge_->fireHashTableReadyCallback(
+      *table_, otherTables, joinHasNullKeys_);
 }
 
 } // namespace facebook::velox::exec
