@@ -21,6 +21,7 @@
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/MergeSource.h"
@@ -34,7 +35,6 @@ namespace facebook::velox::exec {
 
 class OutputBufferManager;
 
-class HashJoinBridge;
 class IndexLookupJoinBridge;
 class NestedLoopJoinBridge;
 class SpatialJoinBridge;
@@ -545,6 +545,17 @@ class Task : public std::enable_shared_from_this<Task> {
       ContinueFuture* future,
       std::vector<ContinuePromise>& promises,
       std::vector<std::shared_ptr<Driver>>& peers);
+
+  /// Registers a callback to be installed on the HashJoinBridge created for
+  /// 'planNodeId'. Must be called before Task::start() so the callback is in
+  /// place when addHashJoinBridgesLocked() instantiates the bridge. The
+  /// callback fires from the last HashBuild driver after allPeersFinished;
+  /// the firing site suspends the driver around the invocation so the
+  /// callback may allocate from arbitrator-tracked task-child pools without
+  /// violating the suspended-driver contract.
+  void registerHashJoinBridgeCallback(
+      const core::PlanNodeId& planNodeId,
+      HashTableReadyCallback callback);
 
   /// Adds HashJoinBridge's for all the specified plan node IDs.
   void addHashJoinBridgesLocked(
@@ -1402,6 +1413,11 @@ class Task : public std::enable_shared_from_this<Task> {
   // Stores inter-operator state (exchange, bridges) per split group. During
   // ungrouped execution we use the [0] entry in this vector.
   std::unordered_map<uint32_t, SplitGroupState> splitGroupStates_;
+
+  // HashTableReadyCallbacks registered before start() and applied to each
+  // HashJoinBridge as it is created by addHashJoinBridgesLocked().
+  std::unordered_map<core::PlanNodeId, HashTableReadyCallback>
+      pendingHashJoinBridgeCallbacks_;
 
   std::weak_ptr<OutputBufferManager> bufferManager_;
 

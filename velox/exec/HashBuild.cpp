@@ -927,6 +927,13 @@ bool HashBuild::finishHashBuild() {
     pool()->release();
   };
 
+  // Fires before prepareJoinTable() so the callback can read per-driver
+  // VectorHasher state before the merge clears it. The driver is suspended
+  // around the invocation so allocations from a task-child pool inside the
+  // callback can trigger arbitration without violating the
+  // suspended-driver invariant.
+  fireHashTableReadyCallbackSuspended(otherTables);
+
   CpuWallTiming timing;
   {
     CpuWallTimer cpuWallTimer{timing};
@@ -979,6 +986,23 @@ bool HashBuild::finishHashBuild() {
     stateCleared_ = true;
   }
   return true;
+}
+
+void HashBuild::fireHashTableReadyCallbackSuspended(
+    const std::vector<std::unique_ptr<BaseHashTable>>& otherTables) {
+  if (!joinBridge_->hasHashTableReadyCallback()) {
+    return;
+  }
+  auto* driver = operatorCtx_->driver();
+  auto* task = operatorCtx_->task().get();
+  const auto stopReason = task->enterSuspended(driver->state());
+  if (stopReason != StopReason::kNone) {
+    return;
+  }
+  auto guard =
+      folly::makeGuard([&]() { task->leaveSuspended(driver->state()); });
+  joinBridge_->fireHashTableReadyCallback(
+      *table_, otherTables, joinHasNullKeys_);
 }
 
 void HashBuild::ensureTableFits(uint64_t numRows) {

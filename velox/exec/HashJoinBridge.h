@@ -35,6 +35,23 @@ class HashJoinBridgeTestHelper;
 using HashJoinTableSpillFunc =
     std::function<SpillPartitionSet(std::shared_ptr<BaseHashTable>)>;
 
+/// Optional callback invoked when hash build completes, before
+/// prepareJoinTable() merges the per-driver hash tables. The callback receives
+/// the last driver's table as 'mainTable' and the other drivers' tables as
+/// 'otherTables', so it can inspect per-driver VectorHasher state before the
+/// merge clears it. The motivating use case is distributed dynamic-filter
+/// extraction in Prestissimo: the engine reads the union of per-driver
+/// discrete key values to construct a tuple-domain filter to push to the
+/// probe side. The callback fires at most once per bridge, from the last
+/// HashBuild driver after allPeersFinished. The firing site suspends the
+/// driver before invoking the callback so the callback may allocate from
+/// a task-child memory pool and trigger arbitration without violating the
+/// suspended-driver invariant.
+using HashTableReadyCallback = std::function<void(
+    const BaseHashTable& mainTable,
+    const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,
+    bool hasNullKeys)>;
+
 /// Hands over a hash table from a multi-threaded build pipeline to a
 /// multi-threaded probe pipeline. This is owned by shared_ptr by all the build
 /// and probe Operator instances concerned. Corresponds to the Presto concept of
@@ -71,6 +88,27 @@ class HashJoinBridge : public JoinBridge {
   void appendSpilledHashTablePartitions(SpillPartitionSet spillPartitionSet);
 
   void setAntiJoinHasNullKeys();
+
+  /// Registers a callback invoked once when hash build completes, before
+  /// prepareJoinTable() clears per-driver VectorHasher state. See note on
+  /// HashTableReadyCallback for the motivating use case and contract.
+  void setHashTableReadyCallback(HashTableReadyCallback callback);
+
+  /// Returns true if a HashTableReadyCallback has been registered and not yet
+  /// fired. Used by the firing site to skip the suspend/resume sequence when
+  /// no callback is registered, so the contract change is zero-cost for
+  /// non-DPP queries.
+  bool hasHashTableReadyCallback();
+
+  /// Fires the registered callback with pre-merge hash tables and clears it
+  /// (move semantics — at most one fire per bridge). Caller must suspend its
+  /// driver before invoking this so callback allocations from task-child
+  /// pools can trigger arbitration safely. Exceptions thrown by the callback
+  /// are caught and logged, not propagated.
+  void fireHashTableReadyCallback(
+      const BaseHashTable& mainTable,
+      const std::vector<std::unique_ptr<BaseHashTable>>& otherTables,
+      bool hasNullKeys);
 
   /// Represents the result of HashBuild operators. In case of an anti join, a
   /// build side entry with a null in a join key makes the join return nothing.
@@ -201,6 +239,8 @@ class HashJoinBridge : public JoinBridge {
   // in parallel, drivers call getAndIncrementClaimedRowContainerId() to ensure
   // the row containers they process do not overlap with each other.
   std::atomic_int unclaimedRowContainerId_{0};
+
+  HashTableReadyCallback hashTableReadyCallback_;
 
   friend test::HashJoinBridgeTestHelper;
 };
